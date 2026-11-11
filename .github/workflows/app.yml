@@ -1,1 +1,804 @@
 
+name: Build APK 2
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write project files
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.stcboost"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.stcboost"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <queries>
+                  <package android:name="moe.shizuku.privileged.api" />
+              </queries>
+              <application
+                  android:label="STC Net Boost"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".MonitorService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="network_speed_monitoring" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/stcboost
+          cat > app/src/main/java/com/stcboost/MainActivity.kt <<'EOF_FILE'
+          package com.stcboost
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.net.TrafficStats
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.WindowInsets
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              private lateinit var prefs: Prefs
+              private val ui = Handler(Looper.getMainLooper())
+              private lateinit var live: TextView
+              private lateinit var simsView: TextView
+              private lateinit var shizukuView: TextView
+              private lateinit var logView: TextView
+              private lateinit var etDl: EditText
+              private lateinit var etUl: EditText
+              private lateinit var etInterval: EditText
+              private lateinit var etCooldown: EditText
+              private lateinit var cbAirplane: CheckBox
+              private var lastRx = 0L
+              private var lastTx = 0L
+              private var lastT = 0L
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      refreshUi()
+                      ui.postDelayed(this, 1000)
+                  }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun tv(size: Float = 15f, bold: Boolean = false) = TextView(this).apply {
+                  textSize = size
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+                  setPadding(0, dp(6), 0, dp(6))
+              }
+
+              private fun btn(text: String, onClick: () -> Unit) = Button(this).apply {
+                  this.text = text
+                  setAllCaps(false)
+                  setOnClickListener { onClick() }
+              }
+
+              private fun row(vararg views: android.view.View) = LinearLayout(this).apply {
+                  orientation = LinearLayout.HORIZONTAL
+                  views.forEach {
+                      addView(it, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+              }
+
+              private fun field(root: LinearLayout, label: String, value: String): EditText {
+                  root.addView(tv(13f).apply { text = label })
+                  val et = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                      setText(value)
+                  }
+                  root.addView(et)
+                  return et
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = Prefs(this)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(12), dp(16), dp(24))
+                  }
+                  val scroll = ScrollView(this).apply {
+                      addView(root)
+                      setOnApplyWindowInsetsListener { v, insets ->
+                          val b = insets.getInsets(WindowInsets.Type.systemBars())
+                          v.setPadding(0, b.top, 0, b.bottom)
+                          insets
+                      }
+                  }
+                  setContentView(scroll)
+
+                  root.addView(tv(22f, true).apply { text = "STC Net Boost" })
+                  live = tv(16f); root.addView(live)
+                  simsView = tv(14f); root.addView(simsView)
+
+                  root.addView(row(
+                      btn("Start") { startMon(false) },
+                      btn("Auto Mode") { startMon(true) },
+                      btn("Stop") { stopMon() }
+                  ))
+                  root.addView(row(
+                      btn("Test now") { startMon(prefs.auto) },
+                      btn("SIM / data settings") { openSimSettings() }
+                  ))
+
+                  root.addView(tv(17f, true).apply { text = "Settings" })
+                  etDl = field(root, "Minimum download (Mbps)", prefs.dlMin.toString())
+                  etUl = field(root, "Minimum upload (Mbps)", prefs.ulMin.toString())
+                  etInterval = field(root, "Check interval (seconds, min 30)", prefs.interval.toString())
+                  etCooldown = field(root, "Wait between refreshes (minutes)", prefs.cooldown.toString())
+                  cbAirplane = CheckBox(this).apply {
+                      text = "Use Airplane toggle (stronger, riskier). Default: mobile data OFF/ON"
+                      isChecked = prefs.airplane
+                  }
+                  root.addView(cbAirplane)
+                  root.addView(btn("Save settings") { saveSettings() })
+
+                  root.addView(tv(17f, true).apply { text = "Shizuku (needed for automatic refresh)" })
+                  shizukuView = tv(14f); root.addView(shizukuView)
+                  root.addView(row(
+                      btn("Open Shizuku") { openShizuku() },
+                      btn("Authorize") { Shell.request() }
+                  ))
+                  root.addView(btn("Disable battery optimization") { batteryOpt() })
+
+                  root.addView(tv(17f, true).apply { text = "Log" })
+                  logView = tv(12f).apply { typeface = Typeface.MONOSPACE }
+                  root.addView(logView)
+
+                  val need = mutableListOf<String>()
+                  if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED)
+                      need.add(Manifest.permission.READ_PHONE_STATE)
+                  if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                      need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  lastT = 0L
+                  ui.post(tick)
+              }
+
+              override fun onPause() {
+                  ui.removeCallbacks(tick)
+                  super.onPause()
+              }
+
+              private fun saveSettings() {
+                  prefs.dlMin = etDl.text.toString().toFloatOrNull()?.coerceAtLeast(0f) ?: prefs.dlMin
+                  prefs.ulMin = etUl.text.toString().toFloatOrNull()?.coerceAtLeast(0f) ?: prefs.ulMin
+                  prefs.interval = etInterval.text.toString().toFloatOrNull()?.toInt()?.coerceAtLeast(30) ?: prefs.interval
+                  prefs.cooldown = etCooldown.text.toString().toFloatOrNull()?.toInt()?.coerceAtLeast(1) ?: prefs.cooldown
+                  prefs.airplane = cbAirplane.isChecked
+              }
+
+              private fun startMon(auto: Boolean) {
+                  saveSettings()
+                  prefs.auto = auto
+                  startForegroundService(Intent(this, MonitorService::class.java).setAction(MonitorService.ACTION_START))
+              }
+
+              private fun stopMon() {
+                  startService(Intent(this, MonitorService::class.java).setAction(MonitorService.ACTION_STOP))
+              }
+
+              private fun openSimSettings() {
+                  try { startActivity(Intent(Settings.ACTION_NETWORK_OPERATOR_SETTINGS)) }
+                  catch (e: Exception) { startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS)) }
+              }
+
+              private fun openShizuku() {
+                  val i = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+                  if (i != null) startActivity(i)
+                  else startActivity(Intent(Intent.ACTION_VIEW,
+                      Uri.parse("https://play.google.com/store/apps/details?id=moe.shizuku.privileged.api")))
+              }
+
+              private fun batteryOpt() {
+                  try {
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                          Uri.parse("package:$packageName")))
+                  } catch (e: Exception) {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+              }
+
+              private fun refreshUi() {
+                  val now = System.currentTimeMillis()
+                  val rx = TrafficStats.getMobileRxBytes()
+                  val tx = TrafficStats.getMobileTxBytes()
+                  var dl = 0.0
+                  var ul = 0.0
+                  if (lastT > 0 && now > lastT && rx >= 0 && tx >= 0) {
+                      val dt = (now - lastT) / 1000.0
+                      dl = (rx - lastRx) * 8 / 1e6 / dt
+                      ul = (tx - lastTx) * 8 / 1e6 / dt
+                  }
+                  lastRx = rx; lastTx = tx; lastT = now
+
+                  val m = Monitor
+                  val sb = StringBuilder()
+                  sb.append("Mode: ").append(if (!m.running) "Stopped" else if (prefs.auto) "AUTO recovery" else "Monitor only").append('\n')
+                  sb.append("Status: ").append(m.status).append('\n')
+                  sb.append("Mobile data: ").append(if (SpeedTester.cellular(this) != null) "connected" else "not connected").append('\n')
+                  sb.append("Live now:  down ").append(fmt(dl)).append("  up ").append(fmt(ul)).append(" Mbps\n")
+                  if (m.lastTestTime > 0) {
+                      sb.append("Last test: down ").append(fmt(m.lastDown)).append("  up ").append(fmt(m.lastUp))
+                          .append(" Mbps (").append((now - m.lastTestTime) / 1000).append("s ago)\n")
+                      m.lastError?.let { sb.append("Note: ").append(it).append('\n') }
+                  }
+                  sb.append("Refreshes done: ").append(m.recoveries)
+                  live.text = sb.toString()
+
+                  val sims = SimReader.read(this)
+                  val ss = StringBuilder()
+                  if (sims.isEmpty()) ss.append("No SIM info (allow Phone permission)")
+                  sims.forEach {
+                      ss.append("SIM ${it.slot + 1}: ${it.name}")
+                      if (it.isStc) ss.append(" [STC]")
+                      if (it.isData) ss.append(" [DATA SIM]")
+                      ss.append("\n   ${it.type}  signal ${it.level}/4")
+                      it.dbm?.let { d -> ss.append("  ${d} dBm") }
+                      ss.append("  data: ${it.state}\n")
+                  }
+                  val stc = sims.firstOrNull { it.isStc }
+                  if (stc != null && !stc.isData) {
+                      ss.append("WARNING: STC is not the mobile-data SIM. Use 'SIM / data settings' and choose STC.")
+                  }
+                  simsView.text = ss.toString()
+
+                  shizukuView.text = when {
+                      !Shell.running() -> "Shizuku: NOT running (open Shizuku and start it)"
+                      !Shell.granted() -> "Shizuku: running, permission NOT granted (tap Authorize)"
+                      else -> "Shizuku: ready"
+                  }
+                  logView.text = m.logText()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/stcboost
+          cat > app/src/main/java/com/stcboost/Monitor.kt <<'EOF_FILE'
+          package com.stcboost
+
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          data class SimInfo(
+              val slot: Int, val name: String, val isStc: Boolean, val isData: Boolean,
+              val type: String, val level: Int, val dbm: Int?, val state: String
+          )
+
+          fun fmt(x: Double): String = String.format(Locale.US, "%.2f", x)
+
+          object Monitor {
+              @Volatile var running = false
+              @Volatile var status = "Stopped"
+              @Volatile var lastDown = 0.0
+              @Volatile var lastUp = 0.0
+              @Volatile var lastTestTime = 0L
+              @Volatile var lastError: String? = null
+              @Volatile var sims: List<SimInfo> = emptyList()
+              @Volatile var recoveries = 0
+              @Volatile var wasLow = false
+              @Volatile var recovering = false
+
+              private val logs = ArrayDeque<String>()
+
+              @Synchronized
+              fun log(msg: String) {
+                  val t = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+                  logs.addFirst("$t  $msg")
+                  while (logs.size > 40) logs.removeLast()
+              }
+
+              @Synchronized
+              fun logText(): String = logs.joinToString("\n")
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/stcboost
+          cat > app/src/main/java/com/stcboost/MonitorService.kt <<'EOF_FILE'
+          package com.stcboost
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import android.provider.Settings
+
+          class MonitorService : Service() {
+              companion object {
+                  const val ACTION_START = "start"
+                  const val ACTION_STOP = "stop"
+                  const val ACTION_NOW = "now"
+                  private const val CH = "monitor"
+                  private const val CH_ALERT = "alert"
+                  private const val ID = 1
+                  private const val ID_ALERT = 2
+              }
+
+              private lateinit var thread: HandlerThread
+              private lateinit var h: Handler
+              private var slowCount = 0
+              private var lastRecovery = 0L
+              private var lastAlert = 0L
+              private val cycle = Runnable { doCycle() }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  thread = HandlerThread("monitor").also { it.start() }
+                  h = Handler(thread.looper)
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH, "Speed monitor", NotificationManager.IMPORTANCE_LOW))
+                  nm.createNotificationChannel(NotificationChannel(CH_ALERT, "Slow internet alerts", NotificationManager.IMPORTANCE_DEFAULT))
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val prefs = Prefs(this)
+                  if (intent?.action == ACTION_STOP) {
+                      prefs.running = false
+                      Monitor.running = false
+                      Monitor.status = "Stopped"
+                      h.removeCallbacksAndMessages(null)
+                      Monitor.log("Monitoring stopped")
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (intent == null && !prefs.running) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  val n = buildNotif("Starting...")
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(ID, n)
+                  }
+                  if (!Monitor.running) {
+                      Monitor.log("Monitoring started (" + (if (prefs.auto) "AUTO recovery" else "monitor only") + ")")
+                  }
+                  Monitor.running = true
+                  prefs.running = true
+                  h.removeCallbacks(cycle)
+                  h.post(cycle)
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  h.removeCallbacksAndMessages(null)
+                  thread.quitSafely()
+                  super.onDestroy()
+              }
+
+              private fun doCycle() {
+                  if (!Monitor.running) return
+                  val prefs = Prefs(this)
+                  var next = prefs.interval * 1000L
+                  try {
+                      Monitor.status = "Testing..."
+                      val r = SpeedTester.test(this)
+                      val now = System.currentTimeMillis()
+                      Monitor.lastDown = r.down
+                      Monitor.lastUp = r.up
+                      Monitor.lastTestTime = now
+                      Monitor.lastError = r.error
+                      Monitor.sims = SimReader.read(this)
+                      val low = r.down < prefs.dlMin || r.up < prefs.ulMin
+
+                      if (Monitor.recovering) {
+                          Monitor.log("After refresh: down ${fmt(r.down)} up ${fmt(r.up)} Mbps -> " + (if (low) "still slow" else "IMPROVED"))
+                          Monitor.recovering = false
+                      }
+
+                      if (low) {
+                          slowCount++
+                          Monitor.status = "Slow (check $slowCount)"
+                          if (!Monitor.wasLow) {
+                              Monitor.log("Slow: down ${fmt(r.down)} up ${fmt(r.up)} Mbps" + (r.error?.let { " [$it]" } ?: ""))
+                          }
+                          next = 20_000L
+                          if (slowCount >= 2) {
+                              next = prefs.interval * 1000L
+                              if (prefs.auto) {
+                                  if (now - lastRecovery >= prefs.cooldown * 60_000L) {
+                                      Monitor.status = "Refreshing network..."
+                                      updateNotif("Refreshing mobile network...")
+                                      val (ok, msg) = Shell.refresh(this, prefs.airplane)
+                                      lastRecovery = System.currentTimeMillis()
+                                      Monitor.recoveries++
+                                      Monitor.log(msg)
+                                      slowCount = 0
+                                      if (ok) {
+                                          Monitor.recovering = true
+                                          next = 25_000L
+                                      } else {
+                                          alert("Internet is slow and automatic refresh failed. Tap to open network settings.")
+                                      }
+                                  }
+                              } else {
+                                  alert("Internet is slow (down ${fmt(r.down)} Mbps). Tap to open network settings.")
+                              }
+                          }
+                      } else {
+                          if (Monitor.wasLow) Monitor.log("Speed OK again: down ${fmt(r.down)} up ${fmt(r.up)} Mbps")
+                          slowCount = 0
+                          Monitor.status = "Good"
+                      }
+                      Monitor.wasLow = low
+                  } catch (e: Throwable) {
+                      Monitor.status = "Error"
+                      Monitor.log("Error: ${e.javaClass.simpleName}")
+                  }
+                  updateNotif("${Monitor.status}  down ${fmt(Monitor.lastDown)} / up ${fmt(Monitor.lastUp)} Mbps")
+                  if (Monitor.running) h.postDelayed(cycle, next)
+              }
+
+              private fun buildNotif(text: String): Notification {
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return Notification.Builder(this, CH)
+                      .setSmallIcon(android.R.drawable.stat_notify_sync)
+                      .setContentTitle("STC Net Boost")
+                      .setContentText(text)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              private fun updateNotif(text: String) {
+                  getSystemService(NotificationManager::class.java).notify(ID, buildNotif(text))
+              }
+
+              private fun alert(text: String) {
+                  val now = System.currentTimeMillis()
+                  if (now - lastAlert < 10 * 60_000L) return
+                  lastAlert = now
+                  val pi = PendingIntent.getActivity(
+                      this, 1, Intent(Settings.ACTION_WIRELESS_SETTINGS), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, CH_ALERT)
+                      .setSmallIcon(android.R.drawable.stat_notify_error)
+                      .setContentTitle("Slow internet")
+                      .setContentText(text)
+                      .setContentIntent(pi)
+                      .setAutoCancel(true)
+                      .build()
+                  getSystemService(NotificationManager::class.java).notify(ID_ALERT, n)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/stcboost
+          cat > app/src/main/java/com/stcboost/Prefs.kt <<'EOF_FILE'
+          package com.stcboost
+
+          import android.content.Context
+
+          class Prefs(ctx: Context) {
+              private val p = ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
+              var dlMin: Float
+                  get() = p.getFloat("dlMin", 1.0f)
+                  set(v) { p.edit().putFloat("dlMin", v).apply() }
+              var ulMin: Float
+                  get() = p.getFloat("ulMin", 0.3f)
+                  set(v) { p.edit().putFloat("ulMin", v).apply() }
+              var interval: Int
+                  get() = p.getInt("interval", 300)
+                  set(v) { p.edit().putInt("interval", v).apply() }
+              var cooldown: Int
+                  get() = p.getInt("cooldown", 10)
+                  set(v) { p.edit().putInt("cooldown", v).apply() }
+              var airplane: Boolean
+                  get() = p.getBoolean("airplane", false)
+                  set(v) { p.edit().putBoolean("airplane", v).apply() }
+              var auto: Boolean
+                  get() = p.getBoolean("auto", false)
+                  set(v) { p.edit().putBoolean("auto", v).apply() }
+              var running: Boolean
+                  get() = p.getBoolean("running", false)
+                  set(v) { p.edit().putBoolean("running", v).apply() }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/stcboost
+          cat > app/src/main/java/com/stcboost/Shell.kt <<'EOF_FILE'
+          package com.stcboost
+
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.provider.Settings
+          import rikka.shizuku.Shizuku
+
+          object Shell {
+              fun running(): Boolean = try { Shizuku.pingBinder() } catch (e: Throwable) { false }
+
+              fun granted(): Boolean = try {
+                  Shizuku.pingBinder() && !Shizuku.isPreV11() &&
+                          Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              } catch (e: Throwable) { false }
+
+              fun request() {
+                  try { Shizuku.requestPermission(100) } catch (e: Throwable) { }
+              }
+
+              private fun exec(cmd: String): Pair<Int, String> {
+                  val m = Shizuku::class.java.getDeclaredMethod(
+                      "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java
+                  )
+                  m.isAccessible = true
+                  val p = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText() + p.errorStream.bufferedReader().readText()
+                  return p.waitFor() to out
+              }
+
+              /** Returns (success, message). */
+              fun refresh(ctx: Context, airplane: Boolean): Pair<Boolean, String> {
+                  if (!running()) return false to "Shizuku is not running - cannot refresh automatically"
+                  if (!granted()) return false to "Shizuku permission not granted"
+                  return try {
+                      if (airplane) {
+                          exec("nohup sh -c 'cmd connectivity airplane-mode enable; sleep 5; cmd connectivity airplane-mode disable' >/dev/null 2>&1 &")
+                          Thread.sleep(12000)
+                          val on = Settings.Global.getInt(ctx.contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) == 1
+                          if (on) {
+                              exec("cmd connectivity airplane-mode disable")
+                              true to "Airplane toggle done (had to force it OFF)"
+                          } else true to "Airplane toggle done"
+                      } else {
+                          val (code, out) = exec("svc data disable; sleep 3; svc data enable")
+                          (code == 0) to "Mobile data toggled OFF/ON (exit=$code) ${out.trim().take(80)}"
+                      }
+                  } catch (e: Throwable) {
+                      false to "Refresh failed: ${e.javaClass.simpleName}: ${e.message}"
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/stcboost
+          cat > app/src/main/java/com/stcboost/SimReader.kt <<'EOF_FILE'
+          package com.stcboost
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.telephony.SubscriptionManager
+          import android.telephony.TelephonyManager
+
+          object SimReader {
+              fun read(ctx: Context): List<SimInfo> {
+                  if (ctx.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
+                      return emptyList()
+                  }
+                  return try {
+                      val sm = ctx.getSystemService(SubscriptionManager::class.java)
+                      val tm = ctx.getSystemService(TelephonyManager::class.java)
+                      val dataSub = SubscriptionManager.getDefaultDataSubscriptionId()
+                      val list = sm.activeSubscriptionInfoList ?: return emptyList()
+                      list.map { si ->
+                          val t = tm.createForSubscriptionId(si.subscriptionId)
+                          val plmn = (si.mccString ?: "") + (si.mncString ?: "")
+                          val name = si.carrierName?.toString() ?: "SIM"
+                          val isStc = plmn == "42001" || name.contains("stc", true) ||
+                                  name.contains("saudi telecom", true)
+                          val ss = t.signalStrength
+                          val cs = ss?.cellSignalStrengths?.firstOrNull()
+                          val dbm = cs?.dbm?.takeIf { it < 0 && it > -200 }
+                          val type = when (t.dataNetworkType) {
+                              TelephonyManager.NETWORK_TYPE_NR -> "5G"
+                              TelephonyManager.NETWORK_TYPE_LTE -> "4G"
+                              TelephonyManager.NETWORK_TYPE_HSPAP, TelephonyManager.NETWORK_TYPE_HSPA,
+                              TelephonyManager.NETWORK_TYPE_HSDPA, TelephonyManager.NETWORK_TYPE_HSUPA,
+                              TelephonyManager.NETWORK_TYPE_UMTS -> "3G"
+                              TelephonyManager.NETWORK_TYPE_EDGE, TelephonyManager.NETWORK_TYPE_GPRS -> "2G"
+                              else -> "-"
+                          }
+                          val state = when (t.dataState) {
+                              TelephonyManager.DATA_CONNECTED -> "connected"
+                              TelephonyManager.DATA_CONNECTING -> "connecting"
+                              TelephonyManager.DATA_SUSPENDED -> "suspended"
+                              else -> "disconnected"
+                          }
+                          SimInfo(si.simSlotIndex, name, isStc, si.subscriptionId == dataSub,
+                              type, ss?.level ?: 0, dbm, state)
+                      }.sortedBy { it.slot }
+                  } catch (e: Throwable) {
+                      emptyList()
+                  }
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/stcboost
+          cat > app/src/main/java/com/stcboost/SpeedTester.kt <<'EOF_FILE'
+          package com.stcboost
+
+          import android.content.Context
+          import android.net.ConnectivityManager
+          import android.net.Network
+          import android.net.NetworkCapabilities
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import kotlin.random.Random
+
+          object SpeedTester {
+              private const val DOWN_BYTES = 500_000
+              private const val UP_BYTES = 100_000
+
+              data class Result(val down: Double, val up: Double, val error: String?)
+
+              fun cellular(ctx: Context): Network? {
+                  val cm = ctx.getSystemService(ConnectivityManager::class.java)
+                  @Suppress("DEPRECATION")
+                  return cm.allNetworks.firstOrNull { n ->
+                      val c = cm.getNetworkCapabilities(n)
+                      c != null && c.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
+                              c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                  }
+              }
+
+              fun test(ctx: Context): Result {
+                  val net = cellular(ctx) ?: return Result(0.0, 0.0, "No mobile data connection")
+                  var down = 0.0
+                  var up = 0.0
+                  var err: String? = null
+                  try { down = download(net) } catch (e: Exception) { err = "Download failed: ${e.javaClass.simpleName}" }
+                  try { up = upload(net) } catch (e: Exception) {
+                      err = (if (err != null) "$err; " else "") + "Upload failed: ${e.javaClass.simpleName}"
+                  }
+                  return Result(down, up, err)
+              }
+
+              private fun download(net: Network): Double {
+                  val c = net.openConnection(URL("https://speed.cloudflare.com/__down?bytes=$DOWN_BYTES")) as HttpURLConnection
+                  c.connectTimeout = 8000
+                  c.readTimeout = 8000
+                  try {
+                      val t0 = System.nanoTime()
+                      var total = 0L
+                      val buf = ByteArray(16384)
+                      c.inputStream.use { s ->
+                          while (true) {
+                              val n = s.read(buf)
+                              if (n < 0) break
+                              total += n
+                              if (System.nanoTime() - t0 > 10_000_000_000L) break
+                          }
+                      }
+                      val sec = (System.nanoTime() - t0) / 1e9
+                      return total * 8 / 1e6 / sec
+                  } finally {
+                      c.disconnect()
+                  }
+              }
+
+              private fun upload(net: Network): Double {
+                  val c = net.openConnection(URL("https://speed.cloudflare.com/__up")) as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.doOutput = true
+                  c.connectTimeout = 8000
+                  c.readTimeout = 8000
+                  c.setFixedLengthStreamingMode(UP_BYTES)
+                  try {
+                      val data = ByteArray(UP_BYTES)
+                      Random.Default.nextBytes(data)
+                      val t0 = System.nanoTime()
+                      c.outputStream.use { it.write(data) }
+                      c.responseCode
+                      val sec = (System.nanoTime() - t0) / 1e9
+                      return UP_BYTES * 8 / 1e6 / sec
+                  } finally {
+                      c.disconnect()
+                  }
+              }
+          }
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "STCNetBoost"
+          include(":app")
+          EOF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: STC-Net-Boost-APK
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
